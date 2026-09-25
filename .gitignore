@@ -1,0 +1,4 @@
+/bmp-collector
+/dist/
+*.test
+*.out
