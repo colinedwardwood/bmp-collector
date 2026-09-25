@@ -47,12 +47,16 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
 - **`collector.go`** — the core library. `bmpcollector.New(listenAddr, cb, opts...)`
   returns a `*Collector` with `Start(ctx)`/`Shutdown(ctx)`. `Start` binds a
   TCP listener and spawns an accept loop; each accepted connection gets its
-  own goroutine running a `bufio.Scanner` with `bmp.SplitBMP` as the split
-  function, feeding each framed message to `bmp.ParseBMPMessage` and then to
-  the caller's `Callback`. No dependency on
-  `go.opentelemetry.io/collector/receiver` — the shape mirrors it (so it can
-  later become a real `receiver.Receiver` or an Alloy component) without
-  hard-depending on it.
+  own goroutine running a `bufio.Scanner` with this package's own
+  `splitBMPMessage` (a validating wrapper around gobgp's header decode --
+  see the fix notes on that function) as the split function, feeding each
+  framed message to `bmp.ParseBMPMessage` and then to the caller's
+  `Callback` (recovered from panics; see `safeInvokeCallback`). The accept
+  loop tolerates transient `Accept()` errors, and each connection is
+  subject to a concurrent-connection cap, an idle read deadline, and TCP
+  keepalive. No dependency on `go.opentelemetry.io/collector/receiver` --
+  the shape mirrors it (so it can later become a real `receiver.Receiver`
+  or an Alloy component) without hard-depending on it.
 - **`collector_test.go`** — an end-to-end test: it starts a real `Collector`
   on a loopback TCP port, dials in as a router would, writes two
   back-to-back serialized BMP RouteMonitoring messages in a single `Write`
@@ -99,9 +103,24 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   `gnmi-collector`/`flow-collector` settle on for their own decoded-record
   types.
 - **Reconnect/backpressure under load is untested.** BMP is one long-lived
-  TCP session per monitored router. This prototype's accept/serve loop has
-  no explicit connection limit, backlog tuning, or behavior documented for
-  a router-side reconnect storm.
+  TCP session per monitored router. The accept/serve loop now has a
+  concurrent-connection cap, a per-connection idle read deadline, and
+  OS-level TCP keepalive (`WithMaxConnections`/`WithIdleTimeout`/
+  `WithTCPKeepAlive`, all with prototype-stage default values), but
+  backlog tuning and behavior under an actual router-side reconnect storm
+  are still untested against anything but the loopback-socket test suite.
+- **Known-unpatched upstream advisory: GO-2026-4736.** `govulncheck ./...`
+  flags [GO-2026-4736](https://pkg.go.dev/vuln/GO-2026-4736) ("GoBGP
+  vulnerable to a denial of service via the NEXT_HOP path attribute") in
+  `github.com/osrg/gobgp/v3@v3.37.0`, with no fixed version available yet
+  (`Fixed in: N/A`). It is reachable from this collector's own decode
+  path: govulncheck's call graph traces it through
+  `Collector.serveConn` → `bmp.ParseBMPMessage` → `bgp.ParseBGPMessage`,
+  i.e. every inbound BMP RouteMonitoring message this collector decodes
+  passes through the vulnerable code. This is a supply-chain risk to
+  track (watch for a gobgp patch release and bump the dependency the
+  moment one ships), not something this repo can fix unilaterally today
+  short of vendoring a patched fork of gobgp's `bgp` package.
 - **Metric set is minimal.** `cmd/bmp-collector` only counts messages by
   type and decode errors. A real deployment would likely want per-AFI/SAFI
   route counts, per-peer session-state gauges (from PeerUp/PeerDown), and

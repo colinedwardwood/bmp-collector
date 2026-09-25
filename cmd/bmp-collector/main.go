@@ -192,9 +192,26 @@ func messageTypeLabel(t uint8) string {
 	}
 }
 
+// unidentifiedRouterAddr is the router_addr label value used for any
+// message received before its connection has completed a valid BMP
+// handshake (see bmpcollector.Record.HandshakeComplete). Per RFC 7854
+// §4.1, a well-behaved peer's very first message is always Initiation,
+// so in practice this bucket is everything that ISN'T a well-behaved BMP
+// peer: port scans, other TCP clients that happen to hit this port,
+// stray/garbled bytes, etc. Without this bucket, the router_addr metric
+// series store would grow one series per distinct source address that
+// merely completes a TCP connection and manages to get any message
+// (even a malformed one that partially decodes) through, which is
+// unbounded and outside this collector's control. See README.md "Open
+// questions".
+const unidentifiedRouterAddr = "unidentified"
+
 func (in *instruments) onRecord(logger *slog.Logger) bmpcollector.Callback {
 	return func(rec bmpcollector.Record) {
-		routerAddr := addrHost(rec.RouterAddr)
+		routerAddr := unidentifiedRouterAddr
+		if rec.HandshakeComplete {
+			routerAddr = addrHost(rec.RouterAddr)
+		}
 		msgType := messageTypeLabel(rec.Message.Header.Type)
 
 		in.messagesTotal.Add(context.Background(), 1, metric.WithAttributes(
@@ -203,7 +220,8 @@ func (in *instruments) onRecord(logger *slog.Logger) bmpcollector.Callback {
 		))
 
 		logger.Debug("bmp-collector: decoded message",
-			"router_addr", routerAddr,
+			"router_addr", addrHost(rec.RouterAddr),
+			"handshake_complete", rec.HandshakeComplete,
 			"message_type", msgType,
 			"peer_addr", rec.PeerHeader.PeerAddress.String(),
 			"peer_as", rec.PeerHeader.PeerAS,
