@@ -103,7 +103,43 @@ const (
 	// than a per-connection buffer that only ever grows (see
 	// readOneBMPMessage's doc comment for why that distinction mattered
 	// in practice for this specific fix).
-	defaultMaxBufferedBytes = 64 << 20 // 64 MiB
+	//
+	// Follow-up fix (issue #27): this was originally 64 MiB (64 << 20),
+	// sized to "fit under a 64MB container" with no headroom left over
+	// for anything else. Independent re-verification found that
+	// undersized: the budget only bounds what THIS package will
+	// knowingly admit, not the Go runtime's own baseline heap/metadata,
+	// goroutine stacks (one, plus a bufio.Reader, per open connection),
+	// or the transient overshoot a synchronized burst of concurrent
+	// large messages causes during ordinary GC lag -- none of which
+	// shrink just because the configured budget is large. A 64 MiB
+	// budget against a 64MB container measured *zero* margin for any of
+	// that, and a synchronized burst (many connections each admitted
+	// around the same moment, each already having acquired its
+	// reservation before GC had a chance to reclaim the previous one's)
+	// needed either a container closer to 160MB+ or artificially staggered
+	// connection arrivals (20ms apart) to avoid an OOM-kill at the
+	// documented default -- a tuning gap, not a broken semaphore.
+	//
+	// Lowered to 16 MiB: this is not a guess -- it's the exact value
+	// this repo's own README already documented as empirically verified
+	// safe (repeatably, across multiple rounds) against a real 64MB
+	// `--memory`-limited container under the same synchronized-burst
+	// repro that OOM-killed the unpatched code. 16 MiB is small enough to
+	// leave meaningful headroom under the common small-container range
+	// this project targets (128-256MB: a 128MB container now has the
+	// budget at 1/8th of the limit, not flush against it) while still
+	// comfortably admitting many realistic BMP messages concurrently
+	// (16 at maxBMPMessageSize, or far more of the KB-sized messages
+	// RFC 7854 traffic is typically made of).
+	//
+	// That still isn't a substitute for operator judgment, though --
+	// see WithMaxBufferedBytes and -max-buffered-bytes's flag help text:
+	// whatever this budget is set to, the container/process memory
+	// limit should exceed it by at least 2x, or +100MB, whichever is
+	// larger, to leave room for the Go runtime/goroutine overhead above,
+	// which this constant's own value cannot account for on its own.
+	defaultMaxBufferedBytes = 16 << 20 // 16 MiB
 )
 
 // bmpHeaderSize mirrors bmp.BMP_HEADER_SIZE (version(1) + length(4) +
@@ -251,23 +287,59 @@ func decodeAndValidateBMPHeader(hdrBytes []byte) (*bmp.BMPHeader, error) {
 // discarding the whole record.
 //
 // It also restores the panic recovery bmp.ParseBMPMessage has internally
-// (gobgp's own parseBMPMessage wraps its body in a deferred recover):
-// reimplementing the decode with exported calls steps outside that
-// internal recover, and this function decodes fully untrusted wire
-// bytes, so it needs its own -- following this package's existing
-// safeInvokeCallback/safeInvokeErrorCallback recover-and-report pattern
-// rather than inventing a new one.
+// (gobgp's own parseBMPMessage wraps its WHOLE body in a deferred
+// recover): reimplementing the decode with exported calls steps outside
+// that internal recover, and this function decodes fully untrusted wire
+// bytes, so it needs its own.
+//
+// CRITICAL fix (issue #27): an earlier version of this function's
+// recover() wrapped the ENTIRE function and unconditionally set msg =
+// nil on any panic -- which discarded the already-decoded Header and
+// PeerHeader on exactly the panic this function most needs to survive.
+// gobgp's own BMPBody.ParseBody implementations do unchecked slice
+// indexing into the variable-length wire body with no bounds checking of
+// their own (confirmed panic sites in github.com/osrg/gobgp/v3's
+// pkg/packet/bmp/bmp.go: BMPStatisticsReport.ParseBody's
+// `data[0:4]` and BMPPeerUpNotification.ParseBody's `data[:16]` /
+// `data[12:16]`) -- so a realistic, trivially-crafted short/truncated
+// body after an otherwise fully-present header and peer header
+// panics inside gobgp's code, and the old recover() handler threw away
+// exactly the Header/PeerHeader this function exists to preserve. The
+// shipped regression test at the time
+// (TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity) only ever
+// corrupted a TLV length field deep inside the body, which gobgp's own
+// code turns into a graceful (non-panicking) error return -- so it never
+// exercised this panic path at all.
+//
+// The fix: decode the fixed-size, safely-parseable prefix of every
+// message -- Header, then (for every type except Initiation/
+// Termination) PeerHeader -- into msg FIRST, with this function's own
+// explicit length checks (not a recover) guarding those decodes, before
+// ever touching the riskier variable-length Body decode. Only that last
+// step -- parseBMPMessageBody, calling into gobgp's own, not-bounds-
+// checked BMPBody.ParseBody -- runs under a recover, scoped to exactly
+// that call. On a panic there, msg (Header + PeerHeader already fully
+// populated) is still returned alongside the resulting error, exactly
+// like the graceful-error case below it.
 func parseBMPMessagePreservingPartial(data []byte) (msg *bmp.BMPMessage, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			msg = nil
-			err = fmt.Errorf("bmpcollector: panic parsing BMP message: %v", r)
-		}
-	}()
+	if len(data) < bmpHeaderSize {
+		return nil, fmt.Errorf("bmpcollector: message (%d bytes) shorter than the %d-byte BMP header", len(data), bmpHeaderSize)
+	}
 
 	msg = &bmp.BMPMessage{}
 	if err = msg.Header.DecodeFromBytes(data); err != nil {
 		return nil, err
+	}
+	// gobgp's BMPHeader.DecodeFromBytes only validates Version; it never
+	// checks Length against len(data) (decodeAndValidateBMPHeader/
+	// readOneBMPMessage already enforce that invariant for every message
+	// this function sees via the real serveConn path, but this function
+	// is also called directly -- by tests and the fuzz target -- with
+	// arbitrary bytes, so re-check it here rather than let a
+	// Length-exceeds-len(data) input panic on the slice expression
+	// below, outside the recover this fix deliberately narrows).
+	if uint32(len(data)) < msg.Header.Length {
+		return nil, fmt.Errorf("bmpcollector: declared length %d exceeds the %d bytes available", msg.Header.Length, len(data))
 	}
 	body := data[bmpHeaderSize:msg.Header.Length]
 
@@ -291,6 +363,16 @@ func parseBMPMessagePreservingPartial(data []byte) (msg *bmp.BMPMessage, err err
 	}
 
 	if msg.Header.Type != bmp.BMP_MSG_INITIATION && msg.Header.Type != bmp.BMP_MSG_TERMINATION {
+		// gobgp's BMPPeerHeader.DecodeFromBytes does its own unchecked
+		// fixed-offset slicing up to data[38:42] with no length check --
+		// safe only because this function guarantees len(body) >=
+		// BMP_PEER_HEADER_SIZE itself before ever calling it, the same
+		// discipline applied to Header above. Everything through this
+		// point is therefore a check-then-decode this function controls,
+		// not something that needs the recover below.
+		if len(body) < bmp.BMP_PEER_HEADER_SIZE {
+			return nil, fmt.Errorf("bmpcollector: message body (%d bytes) is shorter than the %d-byte peer header", len(body), bmp.BMP_PEER_HEADER_SIZE)
+		}
 		if perr := msg.PeerHeader.DecodeFromBytes(body); perr != nil {
 			// gobgp's BMPPeerHeader.DecodeFromBytes never actually
 			// returns a non-nil error today (it's a fixed 42-byte
@@ -302,15 +384,36 @@ func parseBMPMessagePreservingPartial(data []byte) (msg *bmp.BMPMessage, err err
 		body = body[bmp.BMP_PEER_HEADER_SIZE:]
 	}
 
-	if err = msg.Body.ParseBody(msg, body); err != nil {
-		// The fix: always forward msg here. Header and (for every type
-		// except Initiation/Termination) PeerHeader are already fully
-		// decoded at this point no matter which message type this is,
-		// regardless of whether Body's decode itself succeeded.
+	// The fix: msg.Header and (for every type except Initiation/
+	// Termination) msg.PeerHeader are fully decoded and captured in msg
+	// at this point, by this function's own checked decodes above --
+	// none of that ran under a recover, because none of it needed to.
+	// Only this next call reaches into gobgp's own not-bounds-checked
+	// Body decode, so only it is recovered, and on panic it returns msg
+	// (Header/PeerHeader intact) exactly like the graceful-error case.
+	if err = parseBMPMessageBody(msg, body); err != nil {
 		return msg, err
 	}
 
 	return msg, nil
+}
+
+// parseBMPMessageBody calls msg.Body.ParseBody and recovers any panic
+// from it, translating a panic into an ordinary error instead of letting
+// it propagate -- see parseBMPMessagePreservingPartial's doc comment for
+// why this recover is scoped to exactly this one call. gobgp's
+// type-specific BMPBody implementations (BMPStatisticsReport,
+// BMPPeerUpNotification, etc.) index directly into the variable-length
+// wire body (e.g. data[0:4], data[:16]) with no bounds checking of their
+// own; a short/truncated body panics there rather than returning an
+// error.
+func parseBMPMessageBody(msg *bmp.BMPMessage, body []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("bmpcollector: panic parsing BMP message body (type %d): %v", msg.Header.Type, r)
+		}
+	}()
+	return msg.Body.ParseBody(msg, body)
 }
 
 // Record is one decoded BMP message, handed to the callback.
@@ -490,6 +593,19 @@ func WithTCPKeepAlive(period time.Duration) Option {
 // sized for worst-case conns*maxMessageSize), since disabling it
 // reintroduces the unbounded-aggregate-memory condition this option
 // exists to close off.
+//
+// Sizing n against a container/process memory limit: this budget only
+// bounds what this package will knowingly admit into message buffers --
+// it has no way to account for the Go runtime's own baseline heap,
+// goroutine stacks (one per open connection, plus a small bufio.Reader
+// each), or the transient overshoot a synchronized burst of concurrent
+// large messages causes during ordinary GC lag. Give the container/
+// process memory limit real headroom above n: at least 2x n, or n+100MB,
+// whichever is larger. (This is the same margin documented on
+// -max-buffered-bytes in cmd/bmp-collector and in README.md -- see
+// defaultMaxBufferedBytes's doc comment for the measured burst/GC-lag
+// finding that motivated it; a 1:1 budget-to-limit sizing has been
+// observed to still OOM under a synchronized burst.)
 func WithMaxBufferedBytes(n int64) Option {
 	return func(c *Collector) { c.maxBufferedBytes = n }
 }

@@ -2,17 +2,29 @@
 
 [![CI](https://github.com/colinedwardwood/bmp-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/colinedwardwood/bmp-collector/actions/workflows/ci.yml)
 
-> **Status (2026-10-02, v0.1.1): hardened library, not device-validated.**
-> This started as a spike (2026-09-25) and has since been through three
-> rounds of adversarial review. The first two found and fixed two
-> CRITICAL bugs (a framing DoS and a process-crashing panic); a third,
-> 7-persona round against v0.1.0 found and fixed six more real issues --
-> most notably another CRITICAL one: per-connection and per-message
-> resource caps were each sound in isolation, but their *product* was
-> not, letting ~100-150 ordinary, individually-compliant connections
-> collectively OOM a memory-limited process (reproduced against a
-> container with a tight memory limit before fixing, and reproduced
-> fixed after -- see "Aggregate buffer budget" below). CI
+> **Status (2026-10-02, v0.1.2): hardened library, not device-validated.**
+> This started as a spike (2026-09-25) and has since been through four
+> rounds of adversarial review/independent re-verification. The first two
+> found and fixed two CRITICAL bugs (a framing DoS and a process-crashing
+> panic); a third, 7-persona round against v0.1.0 found and fixed six
+> more real issues -- most notably another CRITICAL one: per-connection
+> and per-message resource caps were each sound in isolation, but their
+> *product* was not, letting ~100-150 ordinary, individually-compliant
+> connections collectively OOM a memory-limited process (reproduced
+> against a container with a tight memory limit before fixing, and
+> reproduced fixed after -- see "Aggregate buffer budget" below). A
+> fourth round -- independent re-verification of that third round's fixes
+> against v0.1.1 -- found two more real, confirmed gaps (tracked as
+> [issue #27](https://github.com/colinedwardwood/alloy-network-collector/issues/27)),
+> both now fixed in this release: (1) `parseBMPMessagePreservingPartial`'s
+> panic recovery used to discard the very Header/PeerHeader it exists to
+> preserve whenever gobgp's own unchecked slice indexing panicked on a
+> truncated body -- fixed by decoding Header/PeerHeader first and scoping
+> the recovery to only the body decode; (2) the `-max-buffered-bytes`
+> default (64MiB) left zero real headroom against the container memory
+> limits it was advertised as safe for -- lowered to 16MiB, with an
+> explicit container-sizing rule now documented on the flag and in
+> "Aggregate buffer budget" below. CI
 > (build/vet/fmt/race-tested unit tests/lint/govulncheck), a real
 > multi-stage Docker build, decode test coverage for all 7 RFC 7854
 > message types, and a fuzz target over the framing+decode path remain
@@ -79,7 +91,7 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   the shape mirrors it (so it can later become a real `receiver.Receiver`
   or an Alloy component) without hard-depending on it.
   - **Aggregate buffer budget (`readOneBMPMessage`, `WithMaxBufferedBytes`,
-    default 64MiB).** Fix for the second round's CRITICAL finding: the
+    default 16MiB).** Fix for the second round's CRITICAL finding: the
     per-connection cap (`WithMaxConnections`, default 1024) and the
     per-message cap (`maxBMPMessageSize`, 1MiB) are each a sound bound in
     isolation, but their *product* -- up to 1024 connections times 1MiB
@@ -97,6 +109,32 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
     own cancellable child context so a connection blocked waiting on an
     exhausted budget is released by `Shutdown` the same way a connection
     blocked in `Read` already was.
+    - **Default lowered from 64MiB to 16MiB, with an explicit sizing
+      rule (issue #27 follow-up).** Independent re-verification found the
+      original 64MiB default had *zero* real headroom against the exact
+      "fits a 64MB container" framing its own doc comment used: the
+      specific claim "survives a synchronized 150-connection burst at a
+      64MB-limited container with default settings" did not reproduce --
+      it needed either a container closer to 160MB+ or artificially
+      staggered (20ms-spaced) connection arrivals to avoid an OOM-kill.
+      Root cause: the budget bounds only what this package knowingly
+      admits into message buffers; it has no way to account for the Go
+      runtime's own baseline heap, per-connection goroutine/stack
+      overhead, or the transient overshoot a synchronized burst of
+      concurrent large messages causes during ordinary GC lag. The new
+      16MiB default is this repo's own already-verified-safe value (see
+      "What's been verified" below -- the exact figure the original
+      container repro used successfully, repeatably, against a real
+      64MB limit) rather than a fresh guess, and leaves the budget at
+      1/8th of a 128MB container instead of flush against a 64MB one.
+      **Sizing rule, wherever this is tuned:** the container/process
+      memory limit should exceed `-max-buffered-bytes`/
+      `WithMaxBufferedBytes` by **at least 2x, or +100MB, whichever is
+      larger** (e.g. the 16MiB default implies at least a ~117MB limit:
+      16MiB+100MB exceeds 2x16MiB, so +100MB is the binding term)
+      to leave room for the runtime/goroutine overhead above -- this is
+      now stated on the `-max-buffered-bytes` flag's own `-help` text as
+      well as here.
   - **Why not `bufio.Scanner`.** An earlier version of this exact fix kept
     the original `bufio.Scanner`-based framing and wrapped its
     `bufio.SplitFunc` with the same admission control. That bounded the
@@ -126,8 +164,43 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
     the partial message, for every type. (2) panic recovery -- gobgp's own
     internal decode has a `recover()`, but reimplementing it with exported
     calls steps outside that recover, and this decodes fully untrusted
-    wire bytes, so this function has its own, following this package's
-    existing `safeInvokeCallback` pattern rather than a new one.
+    wire bytes, so this function has its own.
+    - **Panic recovery is scoped to only the Body decode (issue #27
+      follow-up).** An earlier version of this function wrapped its
+      *entire* body in one `recover()` that unconditionally discarded
+      Header/PeerHeader (set `msg = nil`) on any panic -- which defeated
+      fix (1) above on exactly the panic path. gobgp's own
+      `BMPBody.ParseBody` implementations do unchecked slice indexing
+      into the variable-length wire body with no bounds checking of
+      their own (confirmed in `github.com/osrg/gobgp/v3`'s
+      `pkg/packet/bmp/bmp.go`: `BMPStatisticsReport.ParseBody`'s
+      `data[0:4]`, `BMPPeerUpNotification.ParseBody`'s `data[:16]` /
+      `data[12:16]`) -- so a trivial truncated/short body after an
+      otherwise fully-present header and 42-byte peer header panics
+      *inside gobgp's code*, and the old recover() handler threw away
+      the Header/PeerHeader that had, by that point, already decoded
+      successfully -- the opposite of what this function exists to do.
+      The shipped regression test at the time
+      (`TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity`) only
+      ever corrupted a TLV length deep inside the body, which gobgp
+      turns into a graceful (non-panicking) error -- so it never
+      exercised the panic path at all. Fixed by decoding Header, then
+      PeerHeader (both fixed-size, and both now guarded by this
+      function's own explicit length checks, not a recover) into `msg`
+      *before* ever calling the type-specific Body decode, and scoping
+      the `recover()` to only that last, riskier call
+      (`parseBMPMessageBody`) -- so a panic there still returns the
+      already-captured `msg`, exactly like the graceful-error case.
+      Regression tests:
+      `TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader`
+      and
+      `TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader`
+      in `collector_fixes_test.go`, each with a precondition check
+      confirming the corrupted fixture still panics inside gobgp's own
+      code directly (independent of this package), so a future gobgp fix
+      that adds its own bounds check fails the precondition with a clear
+      message instead of either test silently passing for the wrong
+      reason.
   - **`ErrorCallback`'s `handshakeComplete` parameter.** Fix for a
     cardinality bug: `onRecord`'s `Record.HandshakeComplete` already
     gated the `router_addr` metric label to stop a port scan or any other
@@ -159,7 +232,11 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   maximum-size message must leave live heap within a small multiple of
   the configured budget, not anywhere near `connections * maxMessageSize`
   -- the regression test for the bufio.Scanner-retention pitfall
-  described above).
+  described above). Also holds the issue #27 follow-up round's two
+  panic-recovery regression tests
+  (`TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader`,
+  `TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader`)
+  -- see "`parseBMPMessagePreservingPartial`" above.
 - **`fixtures_test.go`** — one wire-serialized fixture per RFC 7854 §4.2
   message type (RouteMonitoring, StatisticsReport, PeerUpNotification,
   PeerDownNotification, Initiation, Termination, RouteMirroring), each
@@ -198,13 +275,16 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   library's connection/resource-limit options are now exposed as flags
   too: `-max-connections` (default 1024), `-idle-timeout` (default 10m),
   `-tcp-keepalive` (default 30s), and `-max-buffered-bytes` (default
-  64MiB, the aggregate buffer budget above) -- previously only reachable
+  16MiB, the aggregate buffer budget above) -- previously only reachable
   by a Go caller of the library, not tunable on this binary without a
   rebuild. `-max-connections` and `-max-buffered-bytes` are the two
   operator-facing knobs for the aggregate-memory fix: the budget bounds
   total buffering regardless of connection count on its own, and a lower
   `-max-connections` additionally shrinks the worst case before the
-  budget is ever what's doing the bounding.
+  budget is ever what's doing the bounding. `-max-buffered-bytes`'s own
+  `-help` text also states the sizing rule for the container/process
+  memory limit above it (at least 2x, or +100MB, whichever is larger --
+  see "Aggregate buffer budget" above).
 
 ## What's been verified
 
@@ -220,14 +300,57 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   BMP-framed message OOM-killed the unpatched image (`OOMKilled: true`,
   exit code 137) within seconds; the identical repro against the patched
   image completed without the container being OOM-killed, repeatably
-  across multiple rounds. The patched run used `-max-buffered-bytes` set
-  well below the container's own 64MB limit (16MiB), the same tuning
-  this README's "Usage" section recommends for any memory-constrained
-  deployment -- the default (64MiB) sizes the budget alone right at a
-  64MB container's hard limit, leaving no headroom for the Go runtime's
-  own baseline footprint, so a *default-configured* collector still
-  needs a container sized comfortably above the budget, not exactly
-  equal to it.
+  across multiple rounds, using `-max-buffered-bytes=16MiB` against that
+  64MB limit.
+- **Follow-up (issue #27): the *default*-configured collector re-tested
+  against the sizing rule this README now states.** Independent
+  re-verification found the *original* 64MiB default gave the 64MB
+  container repro above zero real headroom -- the specific claim that
+  default settings survived a synchronized 150-connection burst at a
+  64MB limit did not reproduce; it needed either a ~160MB+ container or
+  artificially staggered connection arrivals. The default is now 16MiB
+  (see "Aggregate buffer budget" above). Re-run with the *default*
+  `-max-buffered-bytes`/`-max-connections` (no manual tuning), same
+  synchronized-150-connection/~900KB-message burst shape, against three
+  container sizes:
+  - **128MB** (inside this README's own 128-256MB target range): not
+    OOM-killed; live RSS settled at ~42.6MiB (33% of the limit).
+  - **~117MB** (this README's own stated minimum for the 16MiB default
+    -- `max(2x16MiB, 16MiB+100MB)`): not OOM-killed across three
+    back-to-back/overlapping burst rounds (up to ~300-450 connections
+    transiently open at once); live RSS settled at ~50.4MiB (43% of the
+    limit).
+  - **64MB** (the *original* repro's own container size, i.e. well
+    below this new default's stated minimum, kept purely to show the
+    improvement at a fixed limit): also not OOM-killed -- live RSS
+    reached ~47.2MiB (74% of the limit, the closest margin of the
+    three, as expected for a limit below the stated minimum) -- a
+    concrete improvement over the old 64MiB default, which needed a
+    ~160MB+ container or staggered arrivals to survive the identical
+    burst at this same 64MB limit. This is not a claim that 64MB is a
+    recommended limit for the new default; it demonstrates margin, not
+    a new minimum.
+- **The two issue #27 panic-recovery repros were re-attempted directly
+  against the fixed `parseBMPMessagePreservingPartial` and now preserve
+  peer identity.** A PeerUpNotification and a StatisticsReport, each
+  with a deliberately truncated body after an otherwise fully-present
+  42-byte peer header (the exact corruption shapes the independent
+  re-verification found -- see "`parseBMPMessagePreservingPartial`"
+  above), both still panic inside gobgp's own code as before (confirmed
+  by each test's own precondition check), but the returned message now
+  carries a non-nil `PeerHeader` with the correct `PeerAddress`/`PeerAS`
+  instead of `nil` -- regression tests
+  `TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader`
+  and
+  `TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader`
+  in `collector_fixes_test.go`. Re-ran the full suite after both fixes:
+  `go build ./...`, `go vet ./...`, `gofmt -l .`, and
+  `golangci-lint run ./...` all still clean; `go test ./... -race
+  -count=1 -cover` still green (84.5% coverage, unchanged); `govulncheck
+  ./...` still reports only the same already-tracked, not-reachable
+  GO-2026-4736 (see "Known-unpatched upstream advisory" below --
+  unaffected by either fix); `FuzzSplitAndParseBMPMessage` re-run for
+  35s (~10.2M executions) with zero crashes.
 - Every RFC 7854 §4.2 message type has a passing decode test (see
   `fixtures_test.go`), not just RouteMonitoring, including a
   partial-record-forwarding case for a type other than RouteMonitoring
@@ -373,11 +496,17 @@ push via OTLP/HTTP (e.g. to a Grafana Alloy `otelcol.receiver.otlp`).
 
 Connection/resource limits are tunable without a rebuild: `-max-connections`
 (default 1024), `-idle-timeout` (default 10m), `-tcp-keepalive` (default
-30s), and `-max-buffered-bytes` (default 64MiB -- the aggregate buffer
-budget described under "What's built"). A memory-constrained deployment
-should size `-max-buffered-bytes` to comfortably fit inside the process's
-actual memory limit, and may additionally want to lower `-max-connections`
-below its generous default.
+30s), and `-max-buffered-bytes` (default 16MiB -- the aggregate buffer
+budget described under "What's built"). **Whatever `-max-buffered-bytes`
+is set to, size the container/process memory limit to exceed it by at
+least 2x, or +100MB, whichever is larger** (e.g. the 16MiB default implies
+at least a ~117MB limit) -- this budget bounds only what the collector
+itself will knowingly buffer, not the Go runtime's own baseline footprint,
+per-connection goroutine/stack overhead, or the transient overshoot a
+synchronized burst of large messages can cause during GC lag; a limit set
+right at (or only slightly above) the budget has been observed to still
+OOM under such a burst. A memory-constrained deployment may additionally
+want to lower `-max-connections` below its generous default.
 
 ### With Docker
 

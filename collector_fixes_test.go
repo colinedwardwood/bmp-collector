@@ -32,6 +32,29 @@ package bmpcollector
 // connections each sending one ~900KB message against it) -- that is
 // infrastructure-level (Docker, cgroups) verification outside what a Go
 // unit test can exercise, not duplicated here.
+//
+// issue #27 follow-up round (2026-10-02) added two more:
+//
+//   - TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader
+//   - TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader
+//
+// Both are regression tests for the gap independent re-verification
+// found in parseBMPMessagePreservingPartial's panic recovery: an earlier
+// version's recover() wrapped the *entire* function and unconditionally
+// discarded the already-decoded Header/PeerHeader (set msg = nil) on any
+// panic, including a panic from gobgp's own unchecked slice indexing
+// inside its BMPBody.ParseBody implementations (confirmed sites:
+// BMPStatisticsReport.ParseBody's data[0:4],
+// BMPPeerUpNotification.ParseBody's data[:16]) -- as opposed to
+// TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity in
+// fixtures_test.go, which only ever exercises a graceful *error return*
+// from ParseBody (a crafted TLV length), never this panic path. These
+// two tests drive a message with a fully-present, otherwise-valid
+// 6-byte header and 42-byte peer header, but a type-specific body
+// deliberately truncated short enough to make gobgp's own ParseBody
+// panic, and assert the panic is still recovered with Header/PeerHeader
+// intact in the returned message -- exactly the white-box case the
+// earlier regression test never reached.
 
 import (
 	"bufio"
@@ -44,6 +67,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/osrg/gobgp/v3/pkg/packet/bgp"
 	"github.com/osrg/gobgp/v3/pkg/packet/bmp"
 	"golang.org/x/sync/semaphore"
 )
@@ -383,5 +407,161 @@ func TestCollector_AggregateBufferBudget_SteadyStateMemoryBounded(t *testing.T) 
 	defer shutdownCancel()
 	if err := c.Shutdown(shutdownCtx); err != nil {
 		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// truncateBMPBodyAfterPeerHeader takes a full wire-serialized BMP
+// message (6-byte header + 42-byte peer header + type-specific body)
+// and returns a corrupted copy whose type-specific body is truncated to
+// exactly truncatedBodyLen bytes, with the BMP header's own Length field
+// rewritten to match the new (shorter) total so this collector's own
+// framing reads exactly that many bytes -- the rewritten Length is what
+// makes this a realistic "short body" input (as opposed to simply
+// slicing the wire bytes and leaving Length claiming the original,
+// larger size, which readOneBMPMessage would instead treat as "wait for
+// more bytes that will never arrive").
+func truncateBMPBodyAfterPeerHeader(t testing.TB, wire []byte, truncatedBodyLen int) []byte {
+	t.Helper()
+	const (
+		bmpHdrLen  = 6
+		peerHdrLen = 42
+	)
+	newLen := bmpHdrLen + peerHdrLen + truncatedBodyLen
+	if newLen > len(wire) {
+		t.Fatalf("truncateBMPBodyAfterPeerHeader: truncated length %d exceeds original wire length %d", newLen, len(wire))
+	}
+	out := append([]byte(nil), wire[:newLen]...)
+	binary.BigEndian.PutUint32(out[1:5], uint32(newLen))
+	return out
+}
+
+// ipv6TestPeerHeader is testPeerHeader's (fixtures_test.go) IPv6
+// counterpart: bmp.NewBMPPeerHeader sets BMP_PEER_FLAG_IPV6 in Flags
+// automatically whenever the given address doesn't parse as IPv4, which
+// TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader
+// needs to drive BMPPeerUpNotification.ParseBody down its
+// `data[:16]` (IPv6) branch rather than its `data[12:16]` (IPv4) one --
+// both unchecked on gobgp's side, but the IPv6 branch is the exact one
+// issue #27 cited.
+func ipv6TestPeerHeader() *bmp.BMPPeerHeader {
+	return bmp.NewBMPPeerHeader(
+		bmp.BMP_PEER_TYPE_GLOBAL,
+		0, // flags: pre-policy; IPv6 is set automatically below
+		0, // route distinguisher
+		"2001:db8::1",
+		65010,
+		"198.51.100.1",
+		1758700000.0,
+	)
+}
+
+// TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader
+// is a regression test for the issue #27 follow-up gap: a
+// StatisticsReport whose body (after a fully-present, 42-byte peer
+// header) is shorter than the 4 bytes BMPStatisticsReport.ParseBody
+// unconditionally reads for its Count field (data[0:4]), with no length
+// check of its own, panics inside gobgp's code -- and the panic-recovery
+// handler in place before this fix discarded the Header/PeerHeader that
+// had, by that point, already decoded successfully. Unlike
+// TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity
+// (fixtures_test.go), which corrupts a TLV length deep inside an
+// otherwise-long-enough body (a graceful, non-panicking error from
+// gobgp), this corrupts the body's own length so gobgp panics.
+func TestParseBMPMessagePreservingPartial_TruncatedStatisticsReportBodyPanicsButPreservesPeerHeader(t *testing.T) {
+	wire := buildStatisticsReport(t)
+	// 2 bytes: shorter than the 4 bytes BMPStatisticsReport.ParseBody
+	// needs for data[0:4].
+	const truncatedBodyLen = 2
+	corrupted := truncateBMPBodyAfterPeerHeader(t, wire, truncatedBodyLen)
+
+	// Precondition: confirm this still panics inside gobgp's own
+	// BMPStatisticsReport.ParseBody today, directly, independent of this
+	// package's recovery wrapper -- so a future gobgp release that adds
+	// its own bounds check fails this precondition with a clear message
+	// instead of the rest of this test silently passing for the wrong
+	// reason.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("precondition failed: gobgp's BMPStatisticsReport.ParseBody did not panic on a %d-byte body; this test no longer reproduces the gap it targets", truncatedBodyLen)
+			}
+		}()
+		body := &bmp.BMPStatisticsReport{}
+		truncatedBody := corrupted[6+42:]
+		_ = body.ParseBody(&bmp.BMPMessage{}, truncatedBody)
+	}()
+
+	msg, err := parseBMPMessagePreservingPartial(corrupted)
+	if err == nil {
+		t.Fatalf("expected a non-nil error recovered from the body-decode panic")
+	}
+	if msg == nil {
+		t.Fatalf("msg is nil: the panic-recovery path discarded the already-decoded Header/PeerHeader -- the exact gap this test targets")
+	}
+	if msg.Header.Type != bmp.BMP_MSG_STATISTICS_REPORT {
+		t.Fatalf("Header.Type = %d, want BMP_MSG_STATISTICS_REPORT", msg.Header.Type)
+	}
+	if got := msg.PeerHeader.PeerAddress.String(); got != "198.51.100.1" {
+		t.Fatalf("PeerHeader.PeerAddress = %s, want 198.51.100.1 (preserved despite the body-decode panic)", got)
+	}
+	if msg.PeerHeader.PeerAS != 65010 {
+		t.Fatalf("PeerHeader.PeerAS = %d, want 65010 (preserved despite the body-decode panic)", msg.PeerHeader.PeerAS)
+	}
+}
+
+// TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader
+// is the PeerUpNotification counterpart of the StatisticsReport test
+// above: a body (after a fully-present, 42-byte peer header) shorter
+// than the 16 bytes BMPPeerUpNotification.ParseBody unconditionally
+// reads for its IPv6 LocalAddress field (data[:16]) when the peer
+// header's IPv6 flag is set, with no length check of its own, panics
+// inside gobgp's code. Same gap, same fix, different message type and
+// different one of the two confirmed panic sites (issue #27: "data[:16]
+// and data[0:4] patterns").
+func TestParseBMPMessagePreservingPartial_TruncatedPeerUpNotificationBodyPanicsButPreservesPeerHeader(t *testing.T) {
+	sentOpen := bgp.NewBGPOpenMessage(65010, 180, "198.51.100.1", nil)
+	recvOpen := bgp.NewBGPOpenMessage(65020, 180, "198.51.100.2", nil)
+	peer := ipv6TestPeerHeader()
+	msg := bmp.NewBMPPeerUpNotification(*peer, "2001:db8::1", 179, 52953, sentOpen, recvOpen)
+	wire, err := msg.Serialize()
+	if err != nil {
+		t.Fatalf("serialize synthetic IPv6 BMP PeerUpNotification: %v", err)
+	}
+
+	// 5 bytes: shorter than the 16 bytes BMPPeerUpNotification.ParseBody
+	// needs for data[:16] on the IPv6 path.
+	const truncatedBodyLen = 5
+	corrupted := truncateBMPBodyAfterPeerHeader(t, wire, truncatedBodyLen)
+
+	// Precondition: confirm this still panics inside gobgp's own
+	// BMPPeerUpNotification.ParseBody today, directly, independent of
+	// this package's recovery wrapper (see the StatisticsReport test
+	// above for why).
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("precondition failed: gobgp's BMPPeerUpNotification.ParseBody did not panic on a %d-byte IPv6 body; this test no longer reproduces the gap it targets", truncatedBodyLen)
+			}
+		}()
+		body := &bmp.BMPPeerUpNotification{}
+		truncatedBody := corrupted[6+42:]
+		_ = body.ParseBody(&bmp.BMPMessage{PeerHeader: *peer}, truncatedBody)
+	}()
+
+	parsed, perr := parseBMPMessagePreservingPartial(corrupted)
+	if perr == nil {
+		t.Fatalf("expected a non-nil error recovered from the body-decode panic")
+	}
+	if parsed == nil {
+		t.Fatalf("msg is nil: the panic-recovery path discarded the already-decoded Header/PeerHeader -- the exact gap this test targets")
+	}
+	if parsed.Header.Type != bmp.BMP_MSG_PEER_UP_NOTIFICATION {
+		t.Fatalf("Header.Type = %d, want BMP_MSG_PEER_UP_NOTIFICATION", parsed.Header.Type)
+	}
+	if got := parsed.PeerHeader.PeerAddress.String(); got != "2001:db8::1" {
+		t.Fatalf("PeerHeader.PeerAddress = %s, want 2001:db8::1 (preserved despite the body-decode panic)", got)
+	}
+	if parsed.PeerHeader.PeerAS != 65010 {
+		t.Fatalf("PeerHeader.PeerAS = %d, want 65010 (preserved despite the body-decode panic)", parsed.PeerHeader.PeerAS)
 	}
 }

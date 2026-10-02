@@ -55,10 +55,24 @@ func main() {
 		// shrinks the worst case before that budget is ever the thing
 		// doing the bounding -- an operator who knows their expected
 		// peer count and available memory should tune both together.
+		//
+		// -max-buffered-bytes' own default was lowered from 64MiB to
+		// 16MiB (issue #27 follow-up): independent re-verification found
+		// the old default left zero headroom against the exact
+		// container-memory-limit size ("64MiB budget fits a 64MB
+		// container") its own doc comment advertised as safe -- a
+		// synchronized burst of concurrent large messages could
+		// transiently overshoot that budget during ordinary GC lag,
+		// since neither the budget nor the container limit it was sized
+		// against ever accounted for the Go runtime's own baseline
+		// footprint or per-connection goroutine/stack overhead. See the
+		// flag's own help text below and README.md for the margin this
+		// collector now explicitly recommends between this value and
+		// the container/process memory limit.
 		maxConnections   = flag.Int("max-connections", 1024, "maximum concurrent router connections this collector will accept; <= 0 disables the cap")
 		idleTimeout      = flag.Duration("idle-timeout", 10*time.Minute, "how long a connection may go without any data before it is closed; <= 0 disables the idle timeout")
 		tcpKeepAlive     = flag.Duration("tcp-keepalive", 30*time.Second, "OS-level TCP keepalive probe period for accepted connections; <= 0 disables keepalive")
-		maxBufferedBytes = flag.Int64("max-buffered-bytes", 64<<20, "aggregate byte budget this collector will buffer at once across every connection's in-flight message, regardless of connection count; <= 0 disables the budget (not recommended -- see README.md)")
+		maxBufferedBytes = flag.Int64("max-buffered-bytes", 16<<20, "aggregate byte budget this collector will buffer at once across every connection's in-flight message, regardless of connection count; <= 0 disables the budget (not recommended -- see README.md). IMPORTANT: this budget cannot account for Go runtime/goroutine overhead or a transient burst's GC lag -- size the container/process memory limit to exceed this value by at least 2x, or +100MB, whichever is larger (e.g. 16MiB default -> at least a ~117MB limit: 16MiB+100MB, which exceeds 2x16MiB), or it can still OOM under a synchronized burst of large messages even while staying under its own budget")
 	)
 	flag.Parse()
 
