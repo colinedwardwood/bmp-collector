@@ -5,7 +5,7 @@
 // Prometheus /metrics endpoint -- matching network-topology-exporter's
 // existing dual-output precedent.
 //
-// SPIKE / PROTOTYPE (2026-09-25). See ../../README.md.
+// See ../../README.md for current status.
 package main
 
 import (
