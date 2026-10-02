@@ -27,7 +27,7 @@ import (
 // (Cisco/Juniper/Arista) encode BMP on the wire. It proves the
 // Collector's TCP-framing/decode wiring is correct; it does not by
 // itself prove interop with real hardware.
-func buildSyntheticRouteMonitoring(t *testing.T) []byte {
+func buildSyntheticRouteMonitoring(t testing.TB) []byte {
 	t.Helper()
 
 	nlri := bgp.NewIPAddrPrefix(24, "203.0.113.0")
@@ -93,7 +93,7 @@ func TestCollector_DecodesRouteMonitoringOverTCP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial collector: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Two messages back to back, one write: proves SplitBMP framing
 	// across a single read, not just a single decode call.
@@ -187,7 +187,7 @@ func dialAndShutdownWithinBound(t *testing.T, c *Collector, addr string, write [
 	if err != nil {
 		t.Fatalf("dial collector: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write(write); err != nil {
 		t.Fatalf("write malformed pattern: %v", err)
@@ -296,7 +296,7 @@ func TestCollector_InvalidBMPHeader_RejectsConnectionAndReportsError(t *testing.
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
 		t.Fatalf("write: %v", err)
@@ -385,7 +385,7 @@ func TestCollector_PanicInCallback_DoesNotCrashProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial A: %v", err)
 	}
-	defer connA.Close()
+	defer func() { _ = connA.Close() }()
 	if _, err := connA.Write(wire); err != nil {
 		t.Fatalf("write A: %v", err)
 	}
@@ -406,7 +406,7 @@ func TestCollector_PanicInCallback_DoesNotCrashProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial B: %v", err)
 	}
-	defer connB.Close()
+	defer func() { _ = connB.Close() }()
 
 	nlri := bgp.NewIPAddrPrefix(24, "203.0.114.0")
 	pathAttrs := []bgp.PathAttributeInterface{
@@ -518,7 +518,7 @@ func TestCollector_ForwardsPartialRecordOnInnerAttributeParseError(t *testing.T)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err := conn.Write(corrupted); err != nil {
 		t.Fatalf("write: %v", err)
 	}
@@ -605,7 +605,7 @@ func TestWithErrorCallback(t *testing.T) {
 	if _, err := conn.Write([]byte{0x63, 0x00, 0x00, 0x00, 0x06, 0x00}); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -657,7 +657,7 @@ func TestWithLogger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 
 	// Give the "router connected"/"router disconnected" log lines a
 	// moment to land.

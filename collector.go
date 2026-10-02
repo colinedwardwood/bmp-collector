@@ -3,8 +3,10 @@
 // frames and decodes BMP messages, and hands decoded records to a
 // caller-supplied callback.
 //
-// SPIKE / PROTOTYPE (2026-09-25): see README.md for status and open
-// questions. This is not a production-hardened implementation.
+// See README.md "Status" and "Open questions" for what has (CI, fuzzing,
+// Docker, decode coverage for all 7 RFC 7854 message types) and has not
+// (real-router validation, transport security) been verified as of this
+// writing.
 //
 // The wire-format decoding (BMP envelope + inner BGP UPDATE) is not
 // reimplemented here. It is delegated entirely to
@@ -149,7 +151,7 @@ func splitBMPMessage(data []byte, atEOF bool) (advance int, token []byte, err er
 		// connection rather than waiting on an already-poisoned
 		// buffer for more data that can never produce a valid
 		// token.
-		return 0, nil, fmt.Errorf("%w: %v", errInvalidBMPHeader, decodeErr)
+		return 0, nil, fmt.Errorf("%w: %w", errInvalidBMPHeader, decodeErr)
 	}
 
 	// gobgp's BMPHeader.DecodeFromBytes only validates Version; it
@@ -485,7 +487,7 @@ type idleTimeoutConn struct {
 
 func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 	if c.timeout > 0 {
-		if err := c.Conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
 			return 0, err
 		}
 	}
