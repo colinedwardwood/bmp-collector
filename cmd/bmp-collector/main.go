@@ -41,18 +41,62 @@ func main() {
 		otlpEndpoint = flag.String("otlp-endpoint", "", "OTLP/HTTP metrics endpoint (e.g. alloy:4318); OTLP push is disabled when empty")
 		otlpInsecure = flag.Bool("otlp-insecure", true, "use an unencrypted (http, not https) connection to -otlp-endpoint")
 		pushInterval = flag.Duration("otlp-push-interval", 15*time.Second, "how often to push accumulated counters to -otlp-endpoint")
+
+		// Connection/resource limits. These were previously only
+		// reachable by a Go caller of the bmpcollector library
+		// (WithMaxConnections/WithIdleTimeout/WithTCPKeepAlive/
+		// WithMaxBufferedBytes) with no way to tune them on this
+		// binary short of a rebuild. -max-connections and
+		// -max-buffered-bytes together are also the two operator-facing
+		// mitigations for the aggregate-memory/OOM bug (see
+		// bmpcollector.defaultMaxBufferedBytes): the library's own
+		// admission control bounds aggregate buffering regardless of
+		// connection count, and lowering -max-connections additionally
+		// shrinks the worst case before that budget is ever the thing
+		// doing the bounding -- an operator who knows their expected
+		// peer count and available memory should tune both together.
+		maxConnections   = flag.Int("max-connections", 1024, "maximum concurrent router connections this collector will accept; <= 0 disables the cap")
+		idleTimeout      = flag.Duration("idle-timeout", 10*time.Minute, "how long a connection may go without any data before it is closed; <= 0 disables the idle timeout")
+		tcpKeepAlive     = flag.Duration("tcp-keepalive", 30*time.Second, "OS-level TCP keepalive probe period for accepted connections; <= 0 disables keepalive")
+		maxBufferedBytes = flag.Int64("max-buffered-bytes", 64<<20, "aggregate byte budget this collector will buffer at once across every connection's in-flight message, regardless of connection count; <= 0 disables the budget (not recommended -- see README.md)")
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	if err := run(*listenAddr, *metricsAddr, *otlpEndpoint, *otlpInsecure, *pushInterval, logger); err != nil {
+	cfg := collectorConfig{
+		listenAddr:       *listenAddr,
+		metricsAddr:      *metricsAddr,
+		otlpEndpoint:     *otlpEndpoint,
+		otlpInsecure:     *otlpInsecure,
+		pushInterval:     *pushInterval,
+		maxConnections:   *maxConnections,
+		idleTimeout:      *idleTimeout,
+		tcpKeepAlive:     *tcpKeepAlive,
+		maxBufferedBytes: *maxBufferedBytes,
+	}
+
+	if err := run(cfg, logger); err != nil {
 		logger.Error("bmp-collector: exiting", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(listenAddr, metricsAddr, otlpEndpoint string, otlpInsecure bool, pushInterval time.Duration, logger *slog.Logger) error {
+// collectorConfig holds every flag run needs, so adding one doesn't grow
+// run's own parameter list indefinitely.
+type collectorConfig struct {
+	listenAddr       string
+	metricsAddr      string
+	otlpEndpoint     string
+	otlpInsecure     bool
+	pushInterval     time.Duration
+	maxConnections   int
+	idleTimeout      time.Duration
+	tcpKeepAlive     time.Duration
+	maxBufferedBytes int64
+}
+
+func run(cfg collectorConfig, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -80,9 +124,9 @@ func run(listenAddr, metricsAddr, otlpEndpoint string, otlpInsecure bool, pushIn
 	// prototype can be run standalone (e.g. under `go test`/local dev)
 	// without a collector to push to.
 	var otlpExp sdkmetric.Exporter
-	if otlpEndpoint != "" {
-		opts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpoint(otlpEndpoint)}
-		if otlpInsecure {
+	if cfg.otlpEndpoint != "" {
+		opts := []otlpmetrichttp.Option{otlpmetrichttp.WithEndpoint(cfg.otlpEndpoint)}
+		if cfg.otlpInsecure {
 			opts = append(opts, otlpmetrichttp.WithInsecure())
 		}
 		otlpExp, err = otlpmetrichttp.New(ctx, opts...)
@@ -90,7 +134,7 @@ func run(listenAddr, metricsAddr, otlpEndpoint string, otlpInsecure bool, pushIn
 			return fmt.Errorf("build OTLP metric exporter: %w", err)
 		}
 		readers = append(readers, sdkmetric.WithReader(
-			sdkmetric.NewPeriodicReader(otlpExp, sdkmetric.WithInterval(pushInterval)),
+			sdkmetric.NewPeriodicReader(otlpExp, sdkmetric.WithInterval(cfg.pushInterval)),
 		))
 	} else {
 		logger.Warn("bmp-collector: -otlp-endpoint not set; OTLP push disabled, serving Prometheus /metrics only")
@@ -112,9 +156,13 @@ func run(listenAddr, metricsAddr, otlpEndpoint string, otlpInsecure bool, pushIn
 		return fmt.Errorf("build instruments: %w", err)
 	}
 
-	col := bmpcollector.New(listenAddr, inst.onRecord(logger),
+	col := bmpcollector.New(cfg.listenAddr, inst.onRecord(logger),
 		bmpcollector.WithErrorCallback(inst.onError(logger)),
 		bmpcollector.WithLogger(logger),
+		bmpcollector.WithMaxConnections(cfg.maxConnections),
+		bmpcollector.WithIdleTimeout(cfg.idleTimeout),
+		bmpcollector.WithTCPKeepAlive(cfg.tcpKeepAlive),
+		bmpcollector.WithMaxBufferedBytes(cfg.maxBufferedBytes),
 	)
 	if err := col.Start(ctx); err != nil {
 		return fmt.Errorf("start collector: %w", err)
@@ -122,9 +170,9 @@ func run(listenAddr, metricsAddr, otlpEndpoint string, otlpInsecure bool, pushIn
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	metricsSrv := &http.Server{Addr: metricsAddr, Handler: mux}
+	metricsSrv := &http.Server{Addr: cfg.metricsAddr, Handler: mux}
 	go func() {
-		logger.Info("bmp-collector: serving /metrics", "addr", metricsAddr)
+		logger.Info("bmp-collector: serving /metrics", "addr", cfg.metricsAddr)
 		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("bmp-collector: metrics server failed", "err", err)
 		}
@@ -230,11 +278,26 @@ func (in *instruments) onRecord(logger *slog.Logger) bmpcollector.Callback {
 }
 
 func (in *instruments) onError(logger *slog.Logger) bmpcollector.ErrorCallback {
-	return func(routerAddr net.Addr, err error) {
+	return func(routerAddr net.Addr, handshakeComplete bool, err error) {
+		// Cardinality-bug fix: this must gate on handshakeComplete the
+		// exact same way onRecord already gates router_addr, via the
+		// same unidentifiedRouterAddr bucket. Before this fix, onError
+		// had no handshake signal at all and always used the real
+		// address as the router_addr label -- so, unlike onRecord, a
+		// port scan or any other stray TCP client that never completes
+		// a BMP handshake but manages to trip a decode/read error (the
+		// easiest possible bar: any non-BMP bytes at all) minted its
+		// own bmp.decode_errors_total series forever, unbounded by
+		// anything this collector controls.
+		routerAddrLabel := unidentifiedRouterAddr
+		if handshakeComplete {
+			routerAddrLabel = addrHost(routerAddr)
+		}
 		in.decodeErrorTotal.Add(context.Background(), 1, metric.WithAttributes(
-			attribute.String("router_addr", addrHost(routerAddr)),
+			attribute.String("router_addr", routerAddrLabel),
 		))
-		logger.Warn("bmp-collector: connection error", "router_addr", addrHost(routerAddr), "err", err)
+		logger.Warn("bmp-collector: connection error",
+			"router_addr", addrHost(routerAddr), "handshake_complete", handshakeComplete, "err", err)
 	}
 }
 
