@@ -2,19 +2,26 @@
 
 [![CI](https://github.com/colinedwardwood/bmp-collector/actions/workflows/ci.yml/badge.svg)](https://github.com/colinedwardwood/bmp-collector/actions/workflows/ci.yml)
 
-> **Status (2026-10-02, v0.1.0): hardened library, not device-validated.**
-> This started as a spike (2026-09-25) and has since been through two
-> rounds of adversarial review (two CRITICAL bugs -- a framing DoS and a
-> process-crashing panic -- found and fixed), gained CI (build/vet/fmt/
-> race-tested unit tests/lint/govulncheck), a real multi-stage Docker
-> build, decode test coverage for all 7 RFC 7854 message types, and a
-> fuzz target over the exact framing path the CRITICAL bugs lived in. It
-> is no longer "exploratory, don't build on it" -- but it has **still
-> never been run against a real router** (Cisco/Juniper/Arista/FRR/BIRD),
-> every decode test is a self-serialize/self-parse round trip through
-> gobgp's own encoder (see "Open questions"), and it still has no
-> transport security. Read "Open questions" before depending on this for
-> production traffic.
+> **Status (2026-10-02, v0.1.1): hardened library, not device-validated.**
+> This started as a spike (2026-09-25) and has since been through three
+> rounds of adversarial review. The first two found and fixed two
+> CRITICAL bugs (a framing DoS and a process-crashing panic); a third,
+> 7-persona round against v0.1.0 found and fixed six more real issues --
+> most notably another CRITICAL one: per-connection and per-message
+> resource caps were each sound in isolation, but their *product* was
+> not, letting ~100-150 ordinary, individually-compliant connections
+> collectively OOM a memory-limited process (reproduced against a
+> container with a tight memory limit before fixing, and reproduced
+> fixed after -- see "Aggregate buffer budget" below). CI
+> (build/vet/fmt/race-tested unit tests/lint/govulncheck), a real
+> multi-stage Docker build, decode test coverage for all 7 RFC 7854
+> message types, and a fuzz target over the framing+decode path remain
+> in place and green. It is no longer "exploratory, don't build on it"
+> -- but it has **still never been run against a real router**
+> (Cisco/Juniper/Arista/FRR/BIRD), every decode test is a
+> self-serialize/self-parse round trip through gobgp's own encoder (see
+> "Open questions"), and it still has no transport security. Read "Open
+> questions" before depending on this for production traffic.
 
 A minimal BMP (BGP Monitoring Protocol, [RFC 7854](https://www.rfc-editor.org/rfc/rfc7854)) collector:
 it accepts inbound TCP sessions from routers acting as BMP clients, decodes
@@ -57,16 +64,84 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
 - **`collector.go`** — the core library. `bmpcollector.New(listenAddr, cb, opts...)`
   returns a `*Collector` with `Start(ctx)`/`Shutdown(ctx)`. `Start` binds a
   TCP listener and spawns an accept loop; each accepted connection gets its
-  own goroutine running a `bufio.Scanner` with this package's own
-  `splitBMPMessage` (a validating wrapper around gobgp's header decode --
-  see the fix notes on that function) as the split function, feeding each
-  framed message to `bmp.ParseBMPMessage` and then to the caller's
+  own goroutine that reads it via `readOneBMPMessage` (which applies this
+  package's own header validation -- `decodeAndValidateBMPHeader`, shared
+  with the directly tested/fuzzed `splitBMPMessage` bufio.SplitFunc below
+  -- plus the aggregate buffer-budget admission control, see next bullet)
+  one message at a time. Each framed message goes to
+  `parseBMPMessagePreservingPartial` (this package's own panic-recovering
+  decode, forwarding a partial record -- Header/PeerHeader, even if Body
+  failed -- for every RFC 7854 message type) and then to the caller's
   `Callback` (recovered from panics; see `safeInvokeCallback`). The accept
   loop tolerates transient `Accept()` errors, and each connection is
   subject to a concurrent-connection cap, an idle read deadline, and TCP
   keepalive. No dependency on `go.opentelemetry.io/collector/receiver` --
   the shape mirrors it (so it can later become a real `receiver.Receiver`
   or an Alloy component) without hard-depending on it.
+  - **Aggregate buffer budget (`readOneBMPMessage`, `WithMaxBufferedBytes`,
+    default 64MiB).** Fix for the second round's CRITICAL finding: the
+    per-connection cap (`WithMaxConnections`, default 1024) and the
+    per-message cap (`maxBMPMessageSize`, 1MiB) are each a sound bound in
+    isolation, but their *product* -- up to 1024 connections times 1MiB
+    each -- is not. ~100-150 ordinary, individually-compliant connections
+    each sending one ~900KB message (well under both existing caps) were
+    enough to OOM-kill a container limited to 64MB, reproduced before
+    this fix landed. `readOneBMPMessage` acquires each message's declared
+    length from a collector-wide `golang.org/x/sync/semaphore.Weighted`
+    before allocating or reading any of its body, into a fresh
+    message-sized buffer (not a connection-lifetime one -- see below);
+    `serveConn` releases that reservation once the message has been fully
+    decoded and handed to the callback (or the connection tears down with
+    one still pending). That bounds total buffered bytes by the budget
+    regardless of how many connections are open. Each connection gets its
+    own cancellable child context so a connection blocked waiting on an
+    exhausted budget is released by `Shutdown` the same way a connection
+    blocked in `Read` already was.
+  - **Why not `bufio.Scanner`.** An earlier version of this exact fix kept
+    the original `bufio.Scanner`-based framing and wrapped its
+    `bufio.SplitFunc` with the same admission control. That bounded the
+    *rate* new buffering could start, but not *steady-state* memory: a
+    `Scanner`'s internal buffer only ever grows, never shrinks, so any
+    connection that ever received one large message permanently retained
+    that much capacity for the rest of its lifetime -- and BMP sessions
+    are long-lived by design (RFC 7854: one connection per monitored
+    router, not per message), so this still let steady-state memory
+    approach `connections * maxMessageSize` once enough distinct,
+    otherwise-idle connections had each sent one such message (confirmed
+    in testing: live heap still reached 150+MB against a 16MiB budget
+    under the full many-long-lived-connections repro). `readOneBMPMessage`
+    reads each message into its own freshly-allocated, message-sized
+    buffer instead, which becomes garbage -- and collectible -- the
+    moment that one message is done, regardless of how long the
+    connection stays open afterward. `splitBMPMessage` is kept, unchanged,
+    purely as the directly tested/fuzzed definition of this package's
+    framing-validation rules (see `fuzz_test.go`); production reads no
+    longer go through a `bufio.Scanner` at all.
+  - **`parseBMPMessagePreservingPartial`.** Fix for two issues together:
+    (1) full-record loss -- gobgp's own `bmp.ParseBMPMessage` discards the
+    already-decoded Header/PeerHeader (returns `nil, err`) for every
+    message type *except* `BMP_MSG_ROUTE_MONITORING` when the
+    type-specific Body fails to parse; this function reimplements the
+    same decode sequence with gobgp's exported pieces and always forwards
+    the partial message, for every type. (2) panic recovery -- gobgp's own
+    internal decode has a `recover()`, but reimplementing it with exported
+    calls steps outside that recover, and this decodes fully untrusted
+    wire bytes, so this function has its own, following this package's
+    existing `safeInvokeCallback` pattern rather than a new one.
+  - **`ErrorCallback`'s `handshakeComplete` parameter.** Fix for a
+    cardinality bug: `onRecord`'s `Record.HandshakeComplete` already
+    gated the `router_addr` metric label to stop a port scan or any other
+    un-handshaked TCP client from minting its own metric series forever;
+    `ErrorCallback` had no equivalent signal at all, so `onError` in
+    `cmd/bmp-collector` couldn't apply the same gate. `ErrorCallback` now
+    carries the same boolean `Record.HandshakeComplete` does.
+  - **Start's ctx-watcher goroutine is now tracked in the Collector's
+    wait group**, closing a goroutine leak: previously, for any caller
+    that calls `Shutdown` without first (or ever) cancelling the `ctx`
+    passed to `Start` -- the common case, including every test in this
+    package -- that goroutine parked on `<-ctx.Done()` forever,
+    unaccounted for by `Shutdown`'s wait. A `shutdownCh` internal to the
+    Collector now wakes it on `Shutdown` regardless of `ctx`'s state.
 - **`collector_test.go`** — the original end-to-end test plus the two
   CRITICAL-bug regression tests and the panic-recovery/error-callback/
   logger-option tests: starts a real `Collector` on a loopback TCP port,
@@ -74,23 +149,36 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   correct decode, correct teardown on malformed input, and that a
   panicking `Callback` on one connection never takes another connection
   (or the process) down with it.
+- **`collector_fixes_test.go`** — regression tests for the second
+  adversarial-review round: a 20-cycle Start/Shutdown goroutine-count test
+  for the leak fix; for the aggregate-memory fix, a deterministic
+  `readOneBMPMessage` acquire/block/release test over an in-memory
+  `net.Pipe`, an end-to-end test that `Shutdown` unblocks a connection
+  parked on an exhausted buffer budget, and a steady-state memory test
+  (~100 long-lived, otherwise-idle connections that each sent one
+  maximum-size message must leave live heap within a small multiple of
+  the configured budget, not anywhere near `connections * maxMessageSize`
+  -- the regression test for the bufio.Scanner-retention pitfall
+  described above).
 - **`fixtures_test.go`** — one wire-serialized fixture per RFC 7854 §4.2
   message type (RouteMonitoring, StatisticsReport, PeerUpNotification,
   PeerDownNotification, Initiation, Termination, RouteMirroring), each
   built via gobgp's own constructors, plus a `TestDecode_*` test per type
   that asserts it decodes correctly end to end through the real
-  `Collector`/TCP/`splitBMPMessage`/`bmp.ParseBMPMessage` path -- not just
-  RouteMonitoring, which is all the original test suite covered.
+  `Collector`/TCP/`splitBMPMessage`/`parseBMPMessagePreservingPartial`
+  path -- not just RouteMonitoring, which is all the original test suite
+  covered -- plus a partial-record-forwarding regression test for
+  StatisticsReport paralleling RouteMonitoring's.
 - **`fuzz_test.go`** — `FuzzSplitAndParseBMPMessage`, a native Go fuzz
   target over exactly the two-call sequence `serveConn` drives on every
-  byte a connection sends (`splitBMPMessage` then `bmp.ParseBMPMessage`),
-  seeded with one fixture per message type plus the literal byte patterns
-  from the two CRITICAL bug fixes (`Length=0`, an invalid version byte)
-  and a few adjacent boundary cases (truncated header, mid-message
-  truncation, oversized `Length`). Run locally with
-  `go test -fuzz FuzzSplitAndParseBMPMessage -fuzztime 45s`: 45s / ~13.4M
-  executions / 0 crashes as of this writing. Run it yourself with
-  `go test -fuzz FuzzSplitAndParseBMPMessage`.
+  byte a connection sends (`splitBMPMessage` then
+  `parseBMPMessagePreservingPartial`), seeded with one fixture per message
+  type plus the literal byte patterns from the two original CRITICAL bug
+  fixes (`Length=0`, an invalid version byte) and a few adjacent boundary
+  cases (truncated header, mid-message truncation, oversized `Length`).
+  Run locally with `go test -fuzz FuzzSplitAndParseBMPMessage -fuzztime
+  45s`: 45s / ~13.5M executions / 0 crashes as of this writing. Run it
+  yourself with `go test -fuzz FuzzSplitAndParseBMPMessage`.
 - **`.github/workflows/ci.yml`** — `go build`, `go vet`, a `gofmt -l`
   formatting gate, `go test ./... -race -count=1 -cover`, `golangci-lint`
   (config: `.golangci.yml`), and an informational (non-blocking)
@@ -106,22 +194,56 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   `bmp.decode_errors_total` counter pair reported both via OTLP/HTTP push
   (`-otlp-endpoint`, default-off) and a Prometheus `/metrics` endpoint
   (`-metrics-addr`, default `:9464`) — matching
-  `network-topology-exporter`'s existing dual-output precedent.
+  `network-topology-exporter`'s existing dual-output precedent. The
+  library's connection/resource-limit options are now exposed as flags
+  too: `-max-connections` (default 1024), `-idle-timeout` (default 10m),
+  `-tcp-keepalive` (default 30s), and `-max-buffered-bytes` (default
+  64MiB, the aggregate buffer budget above) -- previously only reachable
+  by a Go caller of the library, not tunable on this binary without a
+  rebuild. `-max-connections` and `-max-buffered-bytes` are the two
+  operator-facing knobs for the aggregate-memory fix: the budget bounds
+  total buffering regardless of connection count on its own, and a lower
+  `-max-connections` additionally shrinks the worst case before the
+  budget is ever what's doing the bounding.
 
 ## What's been verified
 
 - `go build ./...`, `go vet ./...`, `gofmt -l .` (clean), and
   `golangci-lint run ./...` (0 issues, `.golangci.yml`) are all clean.
-- `go test ./... -race -count=1 -cover` passes. Current coverage: **81.4%**
+- `go test ./... -race -count=1 -cover` passes. Current coverage: **84.5%**
   of statements in the `bmpcollector` package (`cmd/bmp-collector` has no
   unit tests yet -- it's a thin flag-parsing/wiring main, exercised only
   manually/via the Docker smoke test described under "Usage").
+- **The aggregate-memory/OOM fix was verified before/after, against a
+  real container memory limit, not just unit tests:** with a 64MB
+  `--memory` limit, ~150 concurrent connections each sending one ~900KB
+  BMP-framed message OOM-killed the unpatched image (`OOMKilled: true`,
+  exit code 137) within seconds; the identical repro against the patched
+  image completed without the container being OOM-killed, repeatably
+  across multiple rounds. The patched run used `-max-buffered-bytes` set
+  well below the container's own 64MB limit (16MiB), the same tuning
+  this README's "Usage" section recommends for any memory-constrained
+  deployment -- the default (64MiB) sizes the budget alone right at a
+  64MB container's hard limit, leaving no headroom for the Go runtime's
+  own baseline footprint, so a *default-configured* collector still
+  needs a container sized comfortably above the budget, not exactly
+  equal to it.
 - Every RFC 7854 §4.2 message type has a passing decode test (see
-  `fixtures_test.go`), not just RouteMonitoring.
-- `FuzzSplitAndParseBMPMessage` ran for 45s (~13.4M executions) locally
+  `fixtures_test.go`), not just RouteMonitoring, including a
+  partial-record-forwarding case for a type other than RouteMonitoring
+  (StatisticsReport).
+- A 20-cycle repeated Start/Shutdown test asserts Go's live goroutine
+  count returns to baseline after every single cycle, using a
+  never-cancelled `context.Background()` -- the exact condition that grew
+  the count unboundedly (2->22, 1->21 over 20 cycles in two runs) before
+  the ctx-watcher goroutine-leak fix.
+- `FuzzSplitAndParseBMPMessage` ran for 45s (~13.5M executions) locally
   with zero crashes, over a seed corpus that includes both known-good
-  fixtures and the exact malicious patterns the two CRITICAL bugs were
-  found with.
+  fixtures and the exact malicious patterns the two original CRITICAL
+  bugs were found with -- now exercising
+  `parseBMPMessagePreservingPartial` (this package's own decode wrapper)
+  rather than calling gobgp's `bmp.ParseBMPMessage` directly, so the fuzz
+  target covers the same panic-recovery path production traffic does.
 - `docker build .` succeeds, and the resulting image starts, binds both
   configured ports, and serves `/metrics` as a non-root user with no
   shell in the image.
@@ -178,23 +300,48 @@ its own TCP accept/serve loop on top of it — see `collector.go`.
   types.
 - **Reconnect/backpressure under load is untested.** BMP is one long-lived
   TCP session per monitored router. The accept/serve loop now has a
-  concurrent-connection cap, a per-connection idle read deadline, and
-  OS-level TCP keepalive (`WithMaxConnections`/`WithIdleTimeout`/
-  `WithTCPKeepAlive`, all with prototype-stage default values), but
-  backlog tuning and behavior under an actual router-side reconnect storm
-  are still untested against anything but the loopback-socket test suite.
-- **Known-unpatched upstream advisory: GO-2026-4736.** `govulncheck ./...`
-  flags [GO-2026-4736](https://pkg.go.dev/vuln/GO-2026-4736) ("GoBGP
+  concurrent-connection cap, a per-connection idle read deadline,
+  OS-level TCP keepalive, and an aggregate buffer-budget admission
+  control (`WithMaxConnections`/`WithIdleTimeout`/`WithTCPKeepAlive`/
+  `WithMaxBufferedBytes`, all with prototype-stage default values and
+  now all exposed as `cmd/bmp-collector` flags too), but backlog tuning
+  and behavior under an actual router-side reconnect storm are still
+  untested against anything but the loopback-socket test suite and the
+  one-shot container-memory-limit repro described above.
+- **Known-unpatched upstream advisory: GO-2026-4736 -- tracked, not
+  demonstrated reachable via this repo's actual import surface.**
+  `govulncheck ./...` flags
+  [GO-2026-4736](https://pkg.go.dev/vuln/GO-2026-4736) ("GoBGP
   vulnerable to a denial of service via the NEXT_HOP path attribute") in
   `github.com/osrg/gobgp/v3@v3.37.0`, with no fixed version available yet
-  (`Fixed in: N/A`). It is reachable from this collector's own decode
-  path: govulncheck's call graph traces it through
-  `Collector.serveConn` → `bmp.ParseBMPMessage` → `bgp.ParseBGPMessage`,
-  i.e. every inbound BMP RouteMonitoring message this collector decodes
-  passes through the vulnerable code. This is a supply-chain risk to
-  track (watch for a gobgp patch release and bump the dependency the
-  moment one ships), not something this repo can fix unilaterally today
-  short of vendoring a patched fork of gobgp's `bgp` package.
+  (`Fixed in: N/A`). govulncheck's static call-graph trace reports a
+  path through this package's own `bgp.ParseBGPMessage` call (now inside
+  `parseBMPMessagePreservingPartial`, the fix for bug #3 below), which
+  looks at first glance like it confirms reachability of the advisory's
+  actual vulnerable code. It doesn't: the advisory's vulnerable code
+  lives in gobgp's `pkg/server` (gobgp acting as a full BGP speaker/BMP
+  *client* -- see "Why this exists" above for why this repo doesn't
+  import that package at all, only `pkg/packet/bmp` + `pkg/packet/bgp`,
+  confirmed via `go list -deps`, which decode wire bytes and don't speak
+  BGP sessions themselves). A second-round adversarial review (security
+  persona) traced the advisory's actual vulnerable code path, then fed
+  the upstream advisory's own malformed-input regression-test bytes
+  through this repo's real call path end to end (`splitBMPMessage` →
+  `parseBMPMessagePreservingPartial` → the inner `bgp.ParseBGPMessage`
+  call) and observed no panic, no hang, and no resource blowup --
+  consistent with the vulnerable code genuinely not being on this
+  repo's import surface, i.e. govulncheck's reachability trace here is
+  an over-approximation (a known class of false positive for this tool:
+  it flags a module-level symbol as reachable from any call into the
+  same package, not only from a call path through the actually-affected
+  function). **Net: this advisory is tracked (watch for a gobgp patch
+  release and bump the dependency the moment one ships, since the
+  specific vulnerable function could change and the question would need
+  re-checking), not confirmed live/exploitable via how this repo
+  actually uses gobgp today.** The `govulncheck` CI job stays
+  informational (`continue-on-error`) on this basis, pending either a
+  gobgp patch or an upstream advisory narrowing that changes this
+  analysis.
 - **Metric set is minimal.** `cmd/bmp-collector` only counts messages by
   type and decode errors. A real deployment would likely want per-AFI/SAFI
   route counts, per-peer session-state gauges (from PeerUp/PeerDown), and
@@ -223,6 +370,14 @@ go run ./cmd/bmp-collector -listen :1790 -metrics-addr :9464
 Point a BMP-speaking router (or a test client) at `:1790`. Metrics are on
 `http://localhost:9464/metrics`. Pass `-otlp-endpoint host:4318` to also
 push via OTLP/HTTP (e.g. to a Grafana Alloy `otelcol.receiver.otlp`).
+
+Connection/resource limits are tunable without a rebuild: `-max-connections`
+(default 1024), `-idle-timeout` (default 10m), `-tcp-keepalive` (default
+30s), and `-max-buffered-bytes` (default 64MiB -- the aggregate buffer
+budget described under "What's built"). A memory-constrained deployment
+should size `-max-buffered-bytes` to comfortably fit inside the process's
+actual memory limit, and may additionally want to lower `-max-connections`
+below its generous default.
 
 ### With Docker
 

@@ -57,11 +57,15 @@ jobs:
     name: govulncheck (informational)
     runs-on: ubuntu-latest
     # Known-unpatched upstream advisory GO-2026-4736 in gobgp/v3@v3.37.0
-    # (see README.md "Open questions") means this job is expected to
-    # report a finding today with no fixed version available yet. It
-    # runs for visibility -- so a *new* advisory doesn't go unnoticed --
-    # without blocking CI on the pre-existing one. continue-on-error
-    # keeps it informational rather than gating.
+    # (see README.md "Open questions" -- tracked, but a second-round
+    # adversarial review found govulncheck's reachability trace through
+    # this repo's own call path to be an over-approximation: the
+    # advisory's actual vulnerable code is in gobgp's pkg/server, which
+    # this repo does not import) means this job is expected to report a
+    # finding today with no fixed version available yet. It runs for
+    # visibility -- so a *new* advisory doesn't go unnoticed -- without
+    # blocking CI on the pre-existing one. continue-on-error keeps it
+    # informational rather than gating.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
