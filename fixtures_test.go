@@ -19,6 +19,7 @@ package bmpcollector
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,6 +260,133 @@ func TestDecode_StatisticsReport(t *testing.T) {
 	}
 	if rec.PeerHeader.PeerAS != 65010 {
 		t.Fatalf("PeerHeader.PeerAS = %d, want 65010", rec.PeerHeader.PeerAS)
+	}
+}
+
+// TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity is the
+// regression test for fix #3: before this fix, a StatisticsReport (or
+// PeerUpNotification/PeerDownNotification/RouteMirroring) message whose
+// body failed to parse was dropped in its entirety, peer identity
+// included -- because gobgp's own ParseBMPMessage discards msg (returns
+// nil) for every message type except BMP_MSG_ROUTE_MONITORING when Body
+// fails to decode, even though Header and PeerHeader had, in every case,
+// already decoded successfully. parseBMPMessagePreservingPartial fixes
+// this by reimplementing the decode sequence itself and always
+// forwarding msg regardless of type.
+//
+// Corrupts the first stat TLV's declared Length field (bytes 54-55 of
+// the wire: 6-byte BMP header + 42-byte peer header + 4-byte Count,
+// right at the start of the first TLV's own Length field) to a value
+// exceeding the remaining buffer, which makes
+// BMPStatisticsReport.ParseBody fail with "value length is not enough"
+// before decoding any TLV -- a clean, deterministic body-decode failure
+// with Header/PeerHeader already fully decoded, parallel to
+// TestCollector_ForwardsPartialRecordOnInnerAttributeParseError's
+// RouteMonitoring case in collector_test.go.
+func TestDecode_StatisticsReportPartialBodyForwardsPeerIdentity(t *testing.T) {
+	wire := buildStatisticsReport(t)
+
+	const (
+		bmpHdrLen  = 6
+		peerHdrLen = 42
+		countLen   = 4
+		tlvTypeLen = 2
+	)
+	lengthFieldOffset := bmpHdrLen + peerHdrLen + countLen + tlvTypeLen
+	if len(wire) < lengthFieldOffset+2 {
+		t.Fatalf("synthetic wire too short (%d bytes) to corrupt at offset %d", len(wire), lengthFieldOffset)
+	}
+
+	corrupted := append([]byte(nil), wire...)
+	corrupted[lengthFieldOffset] = 0xff
+	corrupted[lengthFieldOffset+1] = 0xff
+
+	// Confirm this actually reproduces gobgp's documented (nil, err)
+	// full-record-loss case directly, independent of this package's
+	// Collector, so a future gobgp change that stops exhibiting this
+	// behavior fails this precondition check with a clear message
+	// instead of this test silently passing for the wrong reason.
+	if _, err := bmp.ParseBMPMessage(corrupted); err == nil {
+		t.Fatalf("precondition failed: corrupting the TLV Length field did not produce a decode error from gobgp")
+	}
+	if msg, _ := bmp.ParseBMPMessage(corrupted); msg != nil {
+		t.Fatalf("precondition failed: gobgp.ParseBMPMessage returned a non-nil message for StatisticsReport -- expected the documented nil-on-error case this fix generalizes past")
+	}
+
+	var (
+		mu      sync.Mutex
+		records []Record
+		errs    []error
+	)
+	c := New("127.0.0.1:0", func(r Record) {
+		mu.Lock()
+		defer mu.Unlock()
+		records = append(records, r)
+	}, WithErrorCallback(func(_ net.Addr, _ bool, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, err)
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := c.listener.Addr().String()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write(corrupted); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(records)
+		mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	numRecords := len(records)
+	numErrs := len(errs)
+	var rec Record
+	if numRecords > 0 {
+		rec = records[0]
+	}
+	mu.Unlock()
+
+	if numRecords != 1 {
+		t.Fatalf("got %d records, want 1 (the partially-decoded StatisticsReport forwarded despite the body decode error)", numRecords)
+	}
+	if numErrs == 0 {
+		t.Fatalf("expected the decode error to also be reported via ErrorCallback")
+	}
+	if rec.Message == nil {
+		t.Fatalf("record's Message is nil, want the partially-decoded *bmp.BMPMessage")
+	}
+	if rec.Message.Header.Type != bmp.BMP_MSG_STATISTICS_REPORT {
+		t.Fatalf("Header.Type = %d, want BMP_MSG_STATISTICS_REPORT", rec.Message.Header.Type)
+	}
+	if got := rec.PeerHeader.PeerAddress.String(); got != "198.51.100.1" {
+		t.Fatalf("PeerHeader.PeerAddress = %s, want 198.51.100.1 (preserved despite the body decode error)", got)
+	}
+	if rec.PeerHeader.PeerAS != 65010 {
+		t.Fatalf("PeerHeader.PeerAS = %d, want 65010 (preserved despite the body decode error)", rec.PeerHeader.PeerAS)
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer shutdownCancel()
+	if err := c.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 }
 

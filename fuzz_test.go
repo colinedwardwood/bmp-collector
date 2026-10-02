@@ -2,19 +2,20 @@ package bmpcollector
 
 import (
 	"testing"
-
-	"github.com/osrg/gobgp/v3/pkg/packet/bmp"
 )
 
 // fuzz_test.go fuzzes the same two-stage decode path serveConn drives on
 // every byte that arrives on a connection: splitBMPMessage (this
 // package's framing fix on top of gobgp's header decode) followed by
-// bmp.ParseBMPMessage (gobgp's message-body decode) on whatever token
-// splitBMPMessage produces. It does not go through a real net.Conn /
-// bufio.Scanner -- splitBMPMessage already implements the bufio.SplitFunc
-// contract directly against a byte slice, so calling it in a loop over
-// successive advances reproduces exactly what the Scanner does, without
-// needing a goroutine+socket per fuzz input.
+// parseBMPMessagePreservingPartial (this package's own panic-recovering
+// wrapper around gobgp's message-body decode -- see that function's doc
+// comment -- which is what serveConn actually calls today, in place of
+// calling bmp.ParseBMPMessage directly) on whatever token splitBMPMessage
+// produces. It does not go through a real net.Conn / bufio.Scanner --
+// splitBMPMessage already implements the bufio.SplitFunc contract
+// directly against a byte slice, so calling it in a loop over successive
+// advances reproduces exactly what the Scanner does, without needing a
+// goroutine+socket per fuzz input.
 //
 // Goal: catch a regression in the Length=0 / invalid-version framing fix
 // (see splitBMPMessage's doc comment and the CRITICAL bug writeups in
@@ -95,11 +96,15 @@ func FuzzSplitAndParseBMPMessage(f *testing.F) {
 				t.Fatalf("splitBMPMessage returned a non-nil token with advance=0 (would not make progress)")
 			}
 
-			// Exactly what serveConn does with each framed token:
-			// hand it to gobgp's own message decoder. This must not
-			// panic or hang regardless of what bytes are inside the
-			// frame splitBMPMessage accepted.
-			_, _ = bmp.ParseBMPMessage(token)
+			// Exactly what serveConn does with each framed token: hand
+			// it to this package's own panic-recovering message
+			// decoder. This must not panic (parseBMPMessagePreservingPartial
+			// has its own recover specifically so a malicious frame
+			// can't take the connection's goroutine down -- this fuzz
+			// target is also what proves that recover actually works)
+			// or hang regardless of what bytes are inside the frame
+			// splitBMPMessage accepted.
+			_, _ = parseBMPMessagePreservingPartial(token)
 
 			remaining = remaining[advance:]
 		}

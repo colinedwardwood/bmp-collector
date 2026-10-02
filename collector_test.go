@@ -278,11 +278,14 @@ func TestCollector_InvalidBMPHeader_RejectsConnectionAndReportsError(t *testing.
 		gotErrs  []error
 		gotAddrs []net.Addr
 	)
-	c := New("127.0.0.1:0", func(Record) {}, WithErrorCallback(func(addr net.Addr, err error) {
+	c := New("127.0.0.1:0", func(Record) {}, WithErrorCallback(func(addr net.Addr, handshakeComplete bool, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		gotErrs = append(gotErrs, err)
 		gotAddrs = append(gotAddrs, addr)
+		if handshakeComplete {
+			t.Errorf("handshakeComplete = true, want false (no Initiation was ever sent on this connection)")
+		}
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -501,7 +504,7 @@ func TestCollector_ForwardsPartialRecordOnInnerAttributeParseError(t *testing.T)
 		mu.Lock()
 		defer mu.Unlock()
 		records = append(records, r)
-	}, WithErrorCallback(func(_ net.Addr, err error) {
+	}, WithErrorCallback(func(_ net.Addr, _ bool, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		errs = append(errs, err)
@@ -578,15 +581,17 @@ func TestCollector_ForwardsPartialRecordOnInnerAttributeParseError(t *testing.T)
 // hits a read/decode error.
 func TestWithErrorCallback(t *testing.T) {
 	var (
-		mu   sync.Mutex
-		got  []error
-		addr net.Addr
+		mu                sync.Mutex
+		got               []error
+		addr              net.Addr
+		gotHandshakeState bool
 	)
-	c := New("127.0.0.1:0", func(Record) {}, WithErrorCallback(func(a net.Addr, err error) {
+	c := New("127.0.0.1:0", func(Record) {}, WithErrorCallback(func(a net.Addr, handshakeComplete bool, err error) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = append(got, err)
 		addr = a
+		gotHandshakeState = handshakeComplete
 	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -628,6 +633,9 @@ func TestWithErrorCallback(t *testing.T) {
 	}
 	if !errors.Is(got[0], errInvalidBMPHeader) {
 		t.Fatalf("error = %v, want it to wrap errInvalidBMPHeader", got[0])
+	}
+	if gotHandshakeState {
+		t.Fatalf("handshakeComplete = true, want false (this connection never sent a valid Initiation)")
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
